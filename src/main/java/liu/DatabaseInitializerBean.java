@@ -4,6 +4,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationInfo;
+import org.flywaydb.core.api.MigrationVersion;
 import org.flywaydb.core.api.callback.BaseFlywayCallback;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,19 +12,22 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.io.Resource;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
+import org.springframework.util.StringUtils;
 
 import javax.sql.DataSource;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
-import java.util.Arrays;
-import java.util.Collection;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public class DatabaseInitializerBean implements InitializingBean {
 
     private Log log = LogFactory.getLog(getClass());
     @Autowired
-    private ApplicationContext context;
+    private ApplicationContext applicationContext;
     @Autowired
     private Flyway flyway;
     @Autowired
@@ -37,7 +41,7 @@ public class DatabaseInitializerBean implements InitializingBean {
     @Value("${database.scripts.repair-on-migrate:false}")
     private boolean repairOnMigrate;
 
-    public void migrate() {
+    private void migrate() {
         if (!enabled) {
             log.info("没有启用数据库自动升级");
             return;
@@ -106,7 +110,63 @@ public class DatabaseInitializerBean implements InitializingBean {
     }
 
     public void afterPropertiesSet() throws Exception {
+        //todo 获取脚本
+        initScripts();
+        migrate();
+    }
 
+    private void initScripts() {
+        // initBaseVersionAndScripts
+        String platform = properties.getPlatform();
+
+        if (StringUtils.hasText(baseline)
+                && !VERSION_AUTO.equalsIgnoreCase(baseline)
+                && !VERSION_NONE.equalsIgnoreCase(baseline)) {
+            //如果指定了SQL脚本的版本
+            baselineVersion = Optional.of(MigrationVersion.fromVersion(baseline));
+        } else if (VERSION_AUTO.equalsIgnoreCase(baseline)) {
+            //查找版本最新的脚本
+            Pattern pattern = Pattern.compile(String.format("^.*%s([0-9_\\.]+)%s([\\$].*)?\\.sql$",
+                    Pattern.quote(scriptPrefix),
+                    String.format("(\\-%s)?", Pattern.quote(platform))));
+
+            for (Resource resource : getResources(String.format("classpath*:%s/%s*.sql", scriptLocation, scriptPrefix))) {
+                Matcher matcher = pattern.matcher(resource.getFilename());
+                if (matcher.matches()) {
+                    MigrationVersion version = MigrationVersion.fromVersion(matcher.group(1));
+                    if (!baselineVersion.isPresent() || version.compareTo(baselineVersion.get()) > 0) {
+                        baselineVersion = Optional.of(version);
+                    }
+                }
+            }
+        }
+        if (StringUtils.hasText(scriptDefault)) {
+            //加载默认配置脚本
+            defaultScripts.addAll(getResources(String.format("classpath:%s/%s.sql", scriptLocation, scriptDefault)));
+            defaultScripts.addAll(getResources(String.format("classpath*:%s/%s.*.sql", scriptLocation, scriptDefault)));
+            defaultScripts.addAll(getResources(String.format("classpath*:%s/%s$*.sql", scriptLocation, scriptDefault)));
+
+            defaultScripts.addAll(getResources(String.format("classpath:%s/%s-%s.sql", scriptLocation, scriptDefault, platform)));
+            defaultScripts.addAll(getResources(String.format("classpath*:%s/%s-%s.*.sql", scriptLocation, scriptDefault, platform)));
+            defaultScripts.addAll(getResources(String.format("classpath*:%s/%s-%s$*.sql", scriptLocation, scriptDefault, platform)));
+
+            defaultDataScripts.addAll(getResources(String.format("classpath:%s/%s-data.sql", scriptLocation, scriptDefault)));
+            defaultDataScripts.addAll(getResources(String.format("classpath*:%s/%s-data.*.sql", scriptLocation, scriptDefault)));
+            defaultDataScripts.addAll(getResources(String.format("classpath*:%s/%s-data$*.sql", scriptLocation, scriptDefault)));
+        }
+        if (baselineVersion.isPresent()) {
+            baselineScripts.addAll(getResources(String.format("classpath:%s/%s%s.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()))));
+            baselineScripts.addAll(getResources(String.format("classpath*:%s/%s%s.*.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()))));
+            baselineScripts.addAll(getResources(String.format("classpath*:%s/%s%s$*.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()))));
+
+            baselineScripts.addAll(getResources(String.format("classpath:%s/%s%s-%s.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()), platform)));
+            baselineScripts.addAll(getResources(String.format("classpath*:%s/%s%s-%s.*.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()), platform)));
+            baselineScripts.addAll(getResources(String.format("classpath*:%s/%s%s-%s$*.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()), platform)));
+
+            baselineDataScripts.addAll(getResources(String.format("classpath:%s/%s%s-data.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()))));
+            baselineDataScripts.addAll(getResources(String.format("classpath*:%s/%s%s-data.*.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()))));
+            baselineDataScripts.addAll(getResources(String.format("classpath*:%s/%s%s-data$*.sql", scriptLocation, scriptPrefix, versionToCode(baselineVersion.get()))));
+        }
     }
 
     private void runScripts(Collection<Resource> resources, Connection connection) {
@@ -129,5 +189,22 @@ public class DatabaseInitializerBean implements InitializingBean {
                         info.getScript(),
                         info.getInstalledOn()))
                 .collect(Collectors.joining())));
+    }
+
+    private List<Resource> getResources(String locations) {
+        List<Resource> resources = new ArrayList<Resource>();
+        for (String location : StringUtils.commaDelimitedListToStringArray(locations)) {
+            try {
+                for (Resource resource : this.applicationContext.getResources(location)) {
+                    if (resource.exists()) {
+                        resources.add(resource);
+                    }
+                }
+            } catch (IOException ex) {
+                throw new IllegalStateException(
+                        "Unable to load resource from " + location, ex);
+            }
+        }
+        return resources;
     }
 }
